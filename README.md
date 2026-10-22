@@ -1,4 +1,4 @@
-# Suricata Home Lab
+# Suricata Home Lab 
 
 # Building an Active Defense & Intrusion Detection Lab From Scratch
 
