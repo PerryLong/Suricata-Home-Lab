@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+import json
+import time
+import os
+import sys
+import subprocess
+from collections import defaultdict
+
+EVE_LOG_PATH = "/var/log/suricata/eve.json"
+SCAN_WINDOW_SECONDS = 10
+PORT_THRESHOLD = 15
+
+ip_history = defaultdict(list)
+blocked_ips = set()
+
+def block_ip(ip_address, reason):
+    """Actively drop incoming packets from offending IP via iptables."""
+    if ip_address in blocked_ips:
+        return
+    
+    print(f"[ACTION] ⛔ Dropping traffic from {ip_address} | Reason: {reason}")
+    try:
+        check_cmd = ["iptables", "-C", "INPUT", "-s", ip_address, "-j", "DROP"]
+        exists = subprocess.run(check_cmd, capture_output=True).returncode == 0
+        
+        if not exists:
+            insert_cmd = ["iptables", "-I", "INPUT", "1", "-s", ip_address, "-j", "DROP"]
+            subprocess.run(insert_cmd, check=True)
+            blocked_ips.add(ip_address)
+            print(f"[ACTION] ✅ Successfully blocked {ip_address} in iptables.\n")
+    except Exception as e:
+        print(f"[ERROR] Failed to execute iptables command: {e}")
+
+def tail_file(filepath):
+    if not os.path.exists(filepath):
+        print(f"[!] Target log file not found: {filepath}")
+        sys.exit(1)
+
+    with open(filepath, "r") as f:
+        f.seek(0, os.SEEK_END)
+        while True:
+            line = f.readline()
+            if not line:
+                time.sleep(0.1)
+                continue
+            yield line
+
+def check_port_scan(src_ip, dest_port, current_time):
+    history = ip_history[src_ip]
+    cutoff = current_time - SCAN_WINDOW_SECONDS
+    ip_history[src_ip] = [entry for entry in history if entry[0] > cutoff]
+    ip_history[src_ip].append((current_time, dest_port))
+    
+    unique_ports = {entry[1] for entry in ip_history[src_ip]}
+    if len(unique_ports) >= PORT_THRESHOLD:
+        return len(unique_ports)
+    return None
+
+def main():
+    print("[*] Starting Automated Active Defense Engine (Python)...")
+    print(f"[*] Monitoring live feed: {EVE_LOG_PATH}\n")
+
+    for raw_line in tail_file(EVE_LOG_PATH):
+        try:
+            event = json.loads(raw_line.strip())
+        except json.JSONDecodeError:
+            continue
+
+        event_type = event.get("event_type")
+        src_ip = event.get("src_ip")
+        dest_ip = event.get("dest_ip")
+        dest_port = event.get("dest_port")
+        now = time.time()
+
+        if event_type == "flow" and src_ip and dest_port:
+            distinct_count = check_port_scan(src_ip, dest_port, now)
+            if distinct_count and src_ip not in blocked_ips:
+                print(f"[ALERT: RECONNAISSANCE] {src_ip} hit {distinct_count} ports on {dest_ip}!")
+                block_ip(src_ip, f"Port sweep ({distinct_count} ports)")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[*] Engine stopped.")
+        sys.exit(0)
