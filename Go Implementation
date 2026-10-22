@@ -1,0 +1,147 @@
+package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
+)
+
+const (
+	eveLogPath        = "/var/log/suricata/eve.json"
+	scanWindowSeconds = 10
+	portThreshold     = 15
+)
+
+type SuricataEvent struct {
+	EventType string `json:"event_type"`
+	SrcIP     string `json:"src_ip"`
+	DestIP    string `json:"dest_ip"`
+	DestPort  int    `json:"dest_port"`
+}
+
+type PortScanTracker struct {
+	mu        sync.Mutex
+	history   map[string][]historyEntry
+	blockedIP map[string]bool
+}
+
+type historyEntry struct {
+	timestamp time.Time
+	destPort  int
+}
+
+func newTracker() *PortScanTracker {
+	return &PortScanTracker{
+		history:   make(map[string][]historyEntry),
+		blockedIP: make(map[string]bool),
+	}
+}
+
+func (t *PortScanTracker) blockIP(ip string, reason string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.blockedIP[ip] {
+		return
+	}
+
+	fmt.Printf("[ACTION] ⛔ Dropping traffic from %s | Reason: %s\n", ip, reason)
+
+	checkCmd := exec.Command("iptables", "-C", "INPUT", "-s", ip, "-j", "DROP")
+	if err := checkCmd.Run(); err == nil {
+		t.blockedIP[ip] = true
+		return
+	}
+
+	insertCmd := exec.Command("iptables", "-I", "INPUT", "1", "-s", ip, "-j", "DROP")
+	if err := insertCmd.Run(); err != nil {
+		fmt.Printf("[ERROR] Failed to insert iptables rule: %v\n", err)
+		return
+	}
+
+	t.blockedIP[ip] = true
+	fmt.Printf("[ACTION] ✅ Successfully blocked %s in iptables.\n\n", ip)
+}
+
+func (t *PortScanTracker) checkPortScan(srcIP string, destPort int) (bool, int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	now := time.Now()
+	cutoff := now.Add(-time.Duration(scanWindowSeconds) * time.Second)
+
+	var validEntries []historyEntry
+	for _, entry := range t.history[srcIP] {
+		if entry.timestamp.After(cutoff) {
+			validEntries = append(validEntries, entry)
+		}
+	}
+	validEntries = append(validEntries, historyEntry{timestamp: now, destPort: destPort})
+	t.history[srcIP] = validEntries
+
+	uniquePorts := make(map[int]struct{})
+	for _, entry := range validEntries {
+		uniquePorts[entry.destPort] = struct{}{}
+	}
+
+	distinctCount := len(uniquePorts)
+	return distinctCount >= portThreshold, distinctCount
+}
+
+func main() {
+	fmt.Println("[*] Starting Go Active Defense Engine...")
+	fmt.Printf("[*] Monitoring: %s\n", eveLogPath)
+	fmt.Printf("[*] Threshold: %d distinct ports in %ds\n\n", portThreshold, scanWindowSeconds)
+
+	tracker := newTracker()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		fmt.Println("\n[*] Shutting down Go detection engine.")
+		os.Exit(0)
+	}()
+
+	file, err := os.Open(eveLogPath)
+	if err != nil {
+		fmt.Printf("[!] Could not open log file: %v\n", err)
+		os.Exit(1)
+	}
+	defer file.Close()
+
+	file.Seek(0, io.SeekEnd)
+	reader := bufio.NewReader(file)
+
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			if err == io.EOF {
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			fmt.Printf("[!] Error reading file: %v\n", err)
+			continue
+		}
+
+		var event SuricataEvent
+		if err := json.Unmarshal(line, &event); err != nil {
+			continue
+		}
+
+		if event.EventType == "flow" && event.SrcIP != "" && event.DestPort > 0 {
+			triggered, count := tracker.checkPortScan(event.SrcIP, event.DestPort)
+			if triggered {
+				fmt.Printf("[ALERT: RECONNAISSANCE] %s scanned %d ports on %s!\n", event.SrcIP, count, event.DestIP)
+				tracker.blockIP(event.SrcIP, fmt.Sprintf("Port sweep (%d ports)", count))
+			}
+		}
+	}
+}
